@@ -1,4 +1,6 @@
 ﻿// Program.cs (.NET 7+ minimal API)
+
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -75,9 +77,16 @@ static async Task Proxy(HttpContext ctx, HttpClient client, string path)
 }
 
 // 1) /api/tags  → remote GET /api/models  → Ollama shape
-
+MemoryStream? cachedData = null;
 app.MapGet("/api/tags", async ctx =>
 {
+    if (cachedData != null)
+    {
+        ctx.Response.ContentType = "application/json";
+        await ctx.Response.Body.WriteAsync(cachedData.GetBuffer(), 0, (int)cachedData.Length);
+        return;
+    }
+    
     // 1) fetch remote model list
     var upstream = await httpClient.GetAsync("/api/models");
     ctx.Response.StatusCode = (int)upstream.StatusCode;
@@ -103,28 +112,87 @@ app.MapGet("/api/tags", async ctx =>
         arr = maybeData;
     }
 
-    // 4) extract the nested "ollama" object from each entry
+    // 4) include each model entry: unwrap provider metadata when available, otherwise include full entry
     var list = new List<JsonElement>();
     foreach (var item in arr.EnumerateArray())
     {
-        if (!item.TryGetProperty("ollama", out var ollamaVal))
-            continue;
+        JsonElement modelEntry;
+        
+        // ===========================
+        // Helper to build `JsonElement` in the ollama shape
+        // ===========================
+        static JsonElement BuildOllamaElement(string id, long createdEpoch)
+        {
+            // Convert Unix epoch seconds → ISO 8601 string
+            var modifiedAt = DateTimeOffset
+                .FromUnixTimeSeconds(createdEpoch)
+                .ToString("o");
 
-        if (ollamaVal.ValueKind == JsonValueKind.String)
-        {
-            // Sometimes "ollama" is serialized as a string containing JSON
-            var inner = JsonDocument.Parse(ollamaVal.GetString()!).RootElement;
-            list.Add(inner);
+            // Anonymous object that matches your ollama schema
+            var ollamaObj = new
+            {
+                name        = id,
+                model       = id,
+                modified_at = modifiedAt,
+                size        = 1000000L,      // fill in if you know it
+                digest      = "ac896e5b8b34a1f4efa7b14d7520725140d5512484457fab45d2a4ea14c69dba",      // same
+                details     = new
+                {
+                    parent_model       = "local",
+                    format             = "local",
+                    family             = "local",
+                    families           = new[] { id },
+                    parameter_size     = "100b",
+                    quantization_level = ""
+                },
+                urls = new[] { 0 }     // placeholder
+            };
+
+            // Serialize → parse back into a JsonElement
+            var json = JsonSerializer.Serialize(ollamaObj);
+            return JsonDocument.Parse(json).RootElement;
         }
-        else if (ollamaVal.ValueKind == JsonValueKind.Object)
+        
+        // 1) Already an ollama response?  Just unwrap it.
+        if (item.TryGetProperty("ollama", out var ollamaVal))
         {
-            list.Add(ollamaVal);
+            modelEntry = ollamaVal.ValueKind == JsonValueKind.String
+                ? JsonDocument.Parse(ollamaVal.GetString()!).RootElement
+                : ollamaVal;
         }
+        // 2) Nested OpenAI provider block?  Unwrap and map.
+        else if (item.TryGetProperty("openai", out var openAiVal))
+        {
+           // continue;
+            var id           = openAiVal.GetProperty("id").GetString()!;
+            var createdEpoch = openAiVal.GetProperty("created").GetInt64();
+            modelEntry = BuildOllamaElement(id, createdEpoch);
+        }
+        // 3) “Flat” other model object (the one with top‐level "id", "created", etc.)
+        else if (item.TryGetProperty("id", out var flatId)
+                 && item.TryGetProperty("created", out var flatCreated))
+        {
+           // continue;
+            var id           = flatId.GetString()!;
+            var createdEpoch = flatCreated.GetInt64();
+            modelEntry = BuildOllamaElement(id, createdEpoch);
+        }
+        // 4) Otherwise give them back exactly as they came in
+        else
+        {
+            Console.Error.WriteLine("Could not convert model: " + item);
+            continue;
+        }
+
+        list.Add(modelEntry);
     }
 
-    // 5) write back as JSON array
+    // 5) write back as JSON array of tags (models)
     ctx.Response.ContentType = "application/json";
-    await JsonSerializer.SerializeAsync(ctx.Response.Body, new { models = list });
+    var mem = new MemoryStream();
+    await JsonSerializer.SerializeAsync(mem, new { models = list });
+    cachedData = mem;
+    await ctx.Response.Body.WriteAsync(cachedData.GetBuffer(), 0, (int)cachedData.Length);
 });
 
 // 2) /api/generate  → remote /api/generate
@@ -158,9 +226,27 @@ app.MapPost("/api/chat", async ctx =>
     await using (var w = new Utf8JsonWriter(msBody))
     {
         w.WriteStartObject();
+        var hasStream = false;
         foreach (var p in root.EnumerateObject())
+        {
+            if (p.Name == "stream")
+            {
+                hasStream = true;
+            }
+
+            if (p.Name == "keep_alive" || p.Name == "options")
+            {
+                // TODO: how to do this in ollama?
+                continue;
+            }
+
             p.WriteTo(w);
-        w.WriteBoolean("stream", true);
+        }
+
+        if (!hasStream)
+        {
+            w.WriteBoolean("stream", true);
+        }
         w.WriteEndObject();
     }
     var newBody = msBody.ToArray();
@@ -181,6 +267,15 @@ app.MapPost("/api/chat", async ctx =>
 
     // 4) Prepare our response
     ctx.Response.StatusCode  = (int)upResp.StatusCode;
+    if (upResp.StatusCode != HttpStatusCode.OK)
+    {
+        ctx.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+        var error = await upResp.Content.ReadAsStringAsync();
+        Console.Error.WriteLine("Upstream responded with:" + error);
+        
+        await JsonSerializer.SerializeAsync(ctx.Response.Body, new { error = "some error occured", details = error });
+        return;
+    }
     ctx.Response.ContentType = "application/x-ndjson";
     ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
