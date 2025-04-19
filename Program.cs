@@ -1,5 +1,6 @@
 ﻿// Program.cs (.NET 7+ minimal API)
 
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
@@ -199,17 +200,6 @@ app.MapGet("/api/tags", async ctx =>
 app.MapPost("/api/generate", ctx => Proxy(ctx, httpClient, "/api/generate"));
 
 // 3) /api/chat      → remote /api/chat/completions
-// helper to read lines asynchronously
-static async IAsyncEnumerable<string> ReadLinesAsync(Stream s)
-{
-    var reader = new StreamReader(s);
-    while (!reader.EndOfStream)
-    {
-        var line = await reader.ReadLineAsync();
-        if (line is not null) yield return line;
-    }
-}
-
 // Replace your old /api/chat proxy with this:
 app.MapPost("/api/chat", async ctx =>
 {
@@ -220,6 +210,8 @@ app.MapPost("/api/chat", async ctx =>
 
     using var inDoc = JsonDocument.Parse(inJson);
     var root       = inDoc.RootElement;
+    
+    string? model = null;
 
     // 2) Re-serialize, copying all props and forcing stream=true
     using var msBody = new MemoryStream();
@@ -232,6 +224,11 @@ app.MapPost("/api/chat", async ctx =>
             if (p.Name == "stream")
             {
                 hasStream = true;
+            }
+
+            if (p.Name == "model")
+            {
+                model = p.Value.GetString();
             }
 
             if (p.Name == "keep_alive" || p.Name == "options")
@@ -277,7 +274,7 @@ app.MapPost("/api/chat", async ctx =>
         return;
     }
     ctx.Response.ContentType = "application/x-ndjson";
-    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+    //ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
     // helper: read lines from SSE stream
     async IAsyncEnumerable<string> ReadLines(Stream s)
@@ -290,7 +287,10 @@ app.MapPost("/api/chat", async ctx =>
         }
     }
 
+    var sw = Stopwatch.StartNew();
+    
     // 5) Transform and forward each SSE chunk
+    bool doneSent = false;
     await foreach (var line in ReadLines(await upResp.Content.ReadAsStreamAsync()))
     {
         if (!line.StartsWith("data:")) continue;
@@ -301,7 +301,7 @@ app.MapPost("/api/chat", async ctx =>
         var chunk = chunkDoc.RootElement;
 
         // pull common fields
-        var model = chunk.GetProperty("model").GetString()!;
+        model = chunk.GetProperty("model").GetString()!;
         var createdSecs = chunk.GetProperty("created").GetInt64();
         var createdAt = DateTimeOffset
                           .FromUnixTimeSeconds(createdSecs)
@@ -318,62 +318,29 @@ app.MapPost("/api/chat", async ctx =>
         // finish_reason
         var finishTok = choice.GetProperty("finish_reason");
         var isDone    = finishTok.ValueKind != JsonValueKind.Null;
-
-        // Start writing our Ollama object
-        using var outMs = new MemoryStream();
-        await using (var jw = new Utf8JsonWriter(outMs))
+        if (isDone)
         {
-            jw.WriteStartObject();
-
-            jw.WriteString("model",      model);
-            jw.WriteString("created_at", createdAt);
-
-            // message:{role,content}
-            jw.WritePropertyName("message");
-            jw.WriteStartObject();
-            jw.WriteString("role",    "assistant");
-            jw.WriteString("content", content);
-            jw.WriteEndObject();
-
-            if (!isDone)
-            {
-                // intermediate chunk
-                jw.WriteBoolean("done", false);
-            }
-            else
-            {
-                // final chunk
-                jw.WriteString   ("done_reason", finishTok.GetString());
-                jw.WriteBoolean  ("done",        true);
-
-                // pull the usage object if present
-                if (chunk.TryGetProperty("usage", out var usage) 
-                    && usage.ValueKind == JsonValueKind.Object)
-                {
-                    if (usage.TryGetProperty("total_duration", out var td))
-                        jw.WriteNumber("total_duration", td.GetInt64());
-                    if (usage.TryGetProperty("load_duration", out var ld))
-                        jw.WriteNumber("load_duration",  ld.GetInt64());
-                    if (usage.TryGetProperty("prompt_eval_count", out var pec))
-                        jw.WriteNumber("prompt_eval_count", pec.GetInt32());
-                    if (usage.TryGetProperty("prompt_eval_duration", out var ped))
-                        jw.WriteNumber("prompt_eval_duration", ped.GetInt64());
-                    if (usage.TryGetProperty("eval_count", out var ec))
-                        jw.WriteNumber("eval_count", ec.GetInt32());
-                    if (usage.TryGetProperty("eval_duration", out var ed))
-                        jw.WriteNumber("eval_duration", ed.GetInt64());
-                }
-            }
-
-            jw.WriteEndObject();
+            doneSent = true;
+            sw.Stop();
         }
 
-        // flush the JSON
-        var json = Encoding.UTF8.GetString(outMs.ToArray());
-        await ctx.Response.WriteAsync(json + "\n");
+        // Start writing our Ollama object
+        string json = await WriteOllamaObject(model, createdAt, content, isDone, finishTok.GetString(), chunk, sw);
+        await ctx.Response.WriteAsync(json + (isDone ? "\n\n" : "\n"));
         await ctx.Response.Body.FlushAsync();
 
         if (isDone) break;
+    }
+
+    if (!doneSent)
+    {
+        sw.Stop();
+        var createdAt = DateTimeOffset.UtcNow
+            .ToString("yyyy-MM-ddTHH:mm:ss.fffffff") + "Z";
+        string json = await WriteOllamaObject(model ?? "unknown", createdAt, 
+            "", true, "stop", null, sw);
+        await ctx.Response.WriteAsync(json + "\n\n");
+        await ctx.Response.Body.FlushAsync();
     }
 });
 
@@ -389,3 +356,92 @@ app.MapGet("/api/version",   ctx => Proxy(ctx, httpClient, "/api/version"));
 app.MapGet("/",   ctx => Proxy(ctx, httpClient, "/ollama/"));
 
 app.Run("http://*:4222");
+
+async Task<string> WriteOllamaObject(string mode, string createdAt, string content, bool done, string? finishReason,
+    JsonElement? rawRoot, Stopwatch stopwatch)
+{
+    using var outMs = new MemoryStream();
+    await using (var jw = new Utf8JsonWriter(outMs))
+    {
+        jw.WriteStartObject();
+
+        jw.WriteString("model",      mode);
+        jw.WriteString("created_at", createdAt);
+
+        // message:{role,content}
+        jw.WritePropertyName("message");
+        jw.WriteStartObject();
+        jw.WriteString("role",    "assistant");
+        jw.WriteString("content", content);
+        jw.WriteEndObject();
+
+        if (!done)
+        {
+            // intermediate chunk
+            jw.WriteBoolean("done", false);
+        }
+        else
+        {
+            // final chunk
+            jw.WriteString   ("done_reason", finishReason);
+            jw.WriteBoolean  ("done",        true);
+
+            // pull the usage object if present
+            if ((rawRoot?.TryGetProperty("usage", out var usage) ?? false) 
+                && usage.ValueKind == JsonValueKind.Object)
+            {
+                if (usage.TryGetProperty("total_duration", out var td))
+                    jw.WriteNumber("total_duration", td.GetInt64());
+                else
+                {
+                    jw.WriteNumber("total_duration", (long)stopwatch.Elapsed.TotalNanoseconds);
+                }
+                if (usage.TryGetProperty("load_duration", out var ld))
+                    jw.WriteNumber("load_duration",  ld.GetInt64());
+                else
+                {
+                    jw.WriteNumber("load_duration", 0L);
+                }
+                if (usage.TryGetProperty("prompt_eval_count", out var pec))
+                    jw.WriteNumber("prompt_eval_count", pec.GetInt32());
+                else
+                {
+                    jw.WriteNumber("prompt_eval_count", 0);
+                }
+                if (usage.TryGetProperty("prompt_eval_duration", out var ped))
+                    jw.WriteNumber("prompt_eval_duration", ped.GetInt64());
+                else
+                {
+                    jw.WriteNumber("prompt_eval_duration", 0L);
+                }
+                if (usage.TryGetProperty("eval_count", out var ec))
+                    jw.WriteNumber("eval_count", ec.GetInt32());
+                else
+                {
+                    jw.WriteNumber("eval_count", 0);
+                }
+                if (usage.TryGetProperty("eval_duration", out var ed))
+                    jw.WriteNumber("eval_duration", ed.GetInt64());
+                else
+                {
+                    jw.WriteNumber("eval_duration", 0L);
+                }
+            }
+            else
+            {
+                jw.WriteNumber("total_duration", (long)stopwatch.Elapsed.TotalNanoseconds);
+                jw.WriteNumber("load_duration", 0L);
+                jw.WriteNumber("prompt_eval_count", 0);
+                jw.WriteNumber("prompt_eval_duration", 0L);
+                jw.WriteNumber("eval_count", 0);
+                jw.WriteNumber("eval_duration", 0L);
+            }
+        }
+
+        jw.WriteEndObject();
+    }
+
+    // flush the JSON
+    var json1 = Encoding.UTF8.GetString(outMs.ToArray());
+    return json1;
+}
