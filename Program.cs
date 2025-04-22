@@ -167,7 +167,7 @@ app.MapPost("/api/chat", async ctx =>
 
     // 3) Send to remote with stream=true
     var req = new HttpRequestMessage(HttpMethod.Post,
-                "/api/chat/completions?stream=true")
+                "/api/chat/completions")
     {
         Content = new ByteArrayContent(newBody)
     };
