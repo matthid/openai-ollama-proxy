@@ -387,8 +387,12 @@ app.MapPost("/api/embed",    ctx => Proxy(ctx, httpClient, "/api/embed"));
 app.MapGet("/api/version",   ctx => Proxy(ctx, httpClient, "/api/version"));
 
 // 6) /   → remote /  (if supported)
-var statusCache = new MemoryStream();
-app.MapGet("/",   ctx => Proxy(ctx, httpClient, "/ollama/", cache: statusCache));
+//var statusCache = new MemoryStream();
+app.MapGet("/",  async ctx =>
+{
+    await ctx.Response.WriteAsync("Ollama is running");
+    await ctx.Response.Body.FlushAsync();
+});
 
 app.Run("http://*:4222");
 
