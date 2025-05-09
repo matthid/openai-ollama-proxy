@@ -3,6 +3,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
@@ -21,9 +22,17 @@ var httpClient = new HttpClient { BaseAddress = new Uri(remoteBase) };
 httpClient.DefaultRequestHeaders.Authorization =
     new AuthenticationHeaderValue("Bearer", apiKey);
 
+
 // Generic proxy helper
-static async Task Proxy(HttpContext ctx, HttpClient client, string path)
+static async Task Proxy(HttpContext ctx, HttpClient client, string path, MemoryStream? cache = null, string? contentType = null)
 {
+    if (cache != null && cache.Length > 0)
+    {
+        ctx.Response.ContentType = contentType ?? "application/json";
+        await ctx.Response.Body.WriteAsync(cache.GetBuffer(), 0, (int)cache.Length);
+        return;
+    }
+    
     // build the upstream URI
     var upstream = path + ctx.Request.QueryString;
 
@@ -72,9 +81,17 @@ static async Task Proxy(HttpContext ctx, HttpClient client, string path)
 
     // remove chunked encodings that Kestrel will set itself
     ctx.Response.Headers.Remove("transfer-encoding");
-
-    // finally, stream the response body back to the caller
-    await resp.Content.CopyToAsync(ctx.Response.Body);
+    if (cache != null)
+    {
+        await resp.Content.CopyToAsync(cache);
+        cache.Position = 0;
+        await ctx.Response.Body.WriteAsync(cache.GetBuffer(), 0, (int)cache.Length);
+    }
+    else
+    {
+        // finally, stream the response body back to the caller
+        await resp.Content.CopyToAsync(ctx.Response.Body);
+    }
 }
 
 // 1) /api/tags  → remote GET /api/models  → Ollama shape
@@ -128,7 +145,13 @@ app.MapGet("/api/tags", async ctx =>
             var modifiedAt = DateTimeOffset
                 .FromUnixTimeSeconds(createdEpoch)
                 .ToString("o");
-
+            
+            static string HashWithSHA256(string value)
+            {
+                using var hash = SHA256.Create();
+                var byteArray = hash.ComputeHash(Encoding.UTF8.GetBytes(value));
+                return Convert.ToHexString(byteArray).ToLowerInvariant();
+            }
             // Anonymous object that matches your ollama schema
             var ollamaObj = new
             {
@@ -136,7 +159,7 @@ app.MapGet("/api/tags", async ctx =>
                 model       = id,
                 modified_at = modifiedAt,
                 size        = 1000000L,      // fill in if you know it
-                digest      = "ac896e5b8b34a1f4efa7b14d7520725140d5512484457fab45d2a4ea14c69dba",      // same
+                digest      = HashWithSHA256(id),      // same
                 details     = new
                 {
                     parent_model       = "local",
@@ -293,6 +316,12 @@ app.MapPost("/api/chat", async ctx =>
     bool doneSent = false;
     await foreach (var line in ReadLines(await upResp.Content.ReadAsStreamAsync()))
     {
+        if (doneSent && !string.IsNullOrEmpty(line) && !line.Contains("[DONE]"))
+        {
+            Console.Error.WriteLine("ADDITIONAL LINE RECEIVED AFTER DONE: " + line);
+            continue;
+        }
+        
         if (!line.StartsWith("data:")) continue;
         var payload = line["data:".Length..].Trim();
         if (payload == "[DONE]") break;
@@ -309,6 +338,12 @@ app.MapPost("/api/chat", async ctx =>
                           .ToString("yyyy-MM-ddTHH:mm:ss.fffffff") + "Z";
 
         // choice & delta
+        var choices = chunk.GetProperty("choices");
+        if (choices.GetArrayLength() == 0)
+        {
+            Console.Error.WriteLine("No choices found: " + chunk);
+            continue;
+        }
         var choice = chunk.GetProperty("choices")[0];
         var delta  = choice.GetProperty("delta");
         var content = delta.TryGetProperty("content", out var c)
@@ -329,7 +364,6 @@ app.MapPost("/api/chat", async ctx =>
         await ctx.Response.WriteAsync(json + (isDone ? "\n\n" : "\n"));
         await ctx.Response.Body.FlushAsync();
 
-        if (isDone) break;
     }
 
     if (!doneSent)
@@ -353,7 +387,8 @@ app.MapPost("/api/embed",    ctx => Proxy(ctx, httpClient, "/api/embed"));
 app.MapGet("/api/version",   ctx => Proxy(ctx, httpClient, "/api/version"));
 
 // 6) /   → remote /  (if supported)
-app.MapGet("/",   ctx => Proxy(ctx, httpClient, "/ollama/"));
+var statusCache = new MemoryStream();
+app.MapGet("/",   ctx => Proxy(ctx, httpClient, "/ollama/", cache: statusCache));
 
 app.Run("http://*:4222");
 
