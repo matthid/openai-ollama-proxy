@@ -143,7 +143,7 @@ public class ProxyHelper
         }
     }
     
-    static StreamReader ReadDecodedLines(ICollection<string> contentEncoding, Stream memoryStream)
+    public static StreamReader ReadDecodedLines(ICollection<string> contentEncoding, Stream memoryStream)
     {
         Stream? decoded = null;
         if (contentEncoding.Contains("gzip"))
