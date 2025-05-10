@@ -68,15 +68,14 @@ public class OpenAiChatStream
         
             // finally, stream the response body back to the caller
         var pipe = new Pipe();
-        await using var pipeReader = pipe.Reader.AsStream();
         var contentEncoding = resp.Content.Headers.ContentEncoding;
         Task logTask;
         {
             await using var pipeWriter = pipe.Writer.AsStream();
             logTask = Task.Run(async () =>
             {
+                await using var pipeReader = pipe.Reader.AsStream();
                 var reader = ProxyHelper.ReadDecodedLines(contentEncoding, pipeReader);
-                // you can add BrotliStream, DeflateStream, etc. here
                 while (await reader.ReadLineAsync() is { } line)
                 {
                     if (!string.IsNullOrEmpty(line))

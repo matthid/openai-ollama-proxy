@@ -97,15 +97,14 @@ public class ProxyHelper
             if (logData)
             {
                 var pipe = new Pipe();
-                await using var pipeReader = pipe.Reader.AsStream();
                 var contentEncoding = resp.Content.Headers.ContentEncoding;
                 Task logTask;
                 {
                     await using var pipeWriter = pipe.Writer.AsStream();
                     logTask = Task.Run(async () =>
                     {
+                        await using var pipeReader = pipe.Reader.AsStream();
                         var reader = ReadDecodedLines(contentEncoding, pipeReader);
-                        // you can add BrotliStream, DeflateStream, etc. here
                         while (await reader.ReadLineAsync() is { } line)
                         {
                             if (!string.IsNullOrEmpty(line))
@@ -145,7 +144,7 @@ public class ProxyHelper
     
     public static StreamReader ReadDecodedLines(ICollection<string> contentEncoding, Stream memoryStream)
     {
-        Stream? decoded = null;
+        Stream? decoded;
         if (contentEncoding.Contains("gzip"))
         {
             decoded = new GZipStream(memoryStream, CompressionMode.Decompress);
