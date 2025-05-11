@@ -1,11 +1,30 @@
 ﻿using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.IO.Pipelines;
 using System.Text;
+using System.Text.Json;
 
 namespace http_proxy;
 
 public class OpenAiChatStream
 {
+    private static bool TryReadJson(MemoryStream stream, [NotNullWhen(true)] out JsonDocument? json)
+    {
+        var reader = new Utf8JsonReader(new ReadOnlySpan<byte>(stream.GetBuffer(), 0, (int)stream.Length));
+        if (JsonDocument.TryParseValue(ref reader, out var doc))
+        {
+            json = doc;
+            return true;
+        }
+
+        json = null;
+        return false;
+    }
+    private static T? ReadJsonDataLine<T>(string line)
+    {
+        var jsonPart = line.AsSpan()["data: ".Length..];
+        return JsonSerializer.Deserialize<T>(jsonPart);
+    }
     public static async Task HandleApiChat(HttpClient client, HttpContext ctx)
     {
         var path = "/api/chat/completions";
@@ -16,6 +35,7 @@ public class OpenAiChatStream
         // start building our outgoing HttpRequestMessage
         var req = new HttpRequestMessage(new HttpMethod(ctx.Request.Method), upstream);
 
+        JsonDocument? requestDocument = null;
         // if there's a request body, attach it as stream content
         if (ctx.Request.ContentLength.GetValueOrDefault() > 0
             || ctx.Request.Headers.ContainsKey("Transfer-Encoding"))
@@ -26,8 +46,17 @@ public class OpenAiChatStream
             ctx.Request.EnableBuffering();
             await ctx.Request.Body.CopyToAsync(mem);
             mem.Position = 0;
-            await Console.Error.WriteLineAsync("----------- RAW REQUEST -----------\n" +
-                                               Encoding.UTF8.GetString(mem.GetBuffer(), 0, (int)mem.Length));
+            if (TryReadJson(mem, out var json))
+            {
+                requestDocument = json;
+                await Console.Error.WriteLineAsync("----------- JSON REQUEST -----------\n" +
+                                                   JsonSerializer.Serialize(requestDocument));
+            }
+            else
+            {
+                await Console.Error.WriteLineAsync("----------- RAW REQUEST -----------\n" +
+                                                   Encoding.UTF8.GetString(mem.GetBuffer(), 0, (int)mem.Length));
+            }
             sc = new StreamContent(mem);
            
             // copy the Content-Type header if present
@@ -44,6 +73,8 @@ public class OpenAiChatStream
             req.Headers.TransferEncodingChunked = true;
         }
 
+        var isStreaming = (requestDocument?.RootElement.TryGetProperty("stream", out var streamElem) ?? false) && streamElem.GetBoolean();
+        
         // copy *other* headers (User-Agent, Authorization, custom, etc.), but skip Host
         foreach (var h in ctx.Request.Headers)
         {
@@ -66,44 +97,152 @@ public class OpenAiChatStream
         // remove chunked encodings that Kestrel will set itself
         ctx.Response.Headers.Remove("transfer-encoding");
         
-            // finally, stream the response body back to the caller
-        var pipe = new Pipe();
+        // finally, stream the response body back to the caller
         var contentEncoding = resp.Content.Headers.ContentEncoding;
-        Task logTask;
+        if (isStreaming)
         {
-            await using var pipeWriter = pipe.Writer.AsStream();
-            logTask = Task.Run(async () =>
+            var reader = ProxyHelper.ReadDecodedLines(contentEncoding, await resp.Content.ReadAsStreamAsync());
+            var writer = new StreamWriter(ctx.Response.Body);
+            bool lastWasToolCall = false;
+            while (await reader.ReadLineAsync() is { } line)
             {
-                await using var pipeReader = pipe.Reader.AsStream();
-                var reader = ProxyHelper.ReadDecodedLines(contentEncoding, pipeReader);
-                while (await reader.ReadLineAsync() is { } line)
+                if (string.IsNullOrEmpty(line))
                 {
-                    if (!string.IsNullOrEmpty(line))
-                        Console.Error.WriteLine("---- RAW RESPONSE LINE (decompressed) ----\n" + line);
+                    await writer.WriteLineAsync(line);
                 }
-            });
-
-            var buffer = ArrayPool<byte>.Shared.Rent(81920);
-            try
-            {
-                int n;
-                var stream = await resp.Content.ReadAsStreamAsync();
-                while ((n = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                else if (line.Contains("[DONE]"))
                 {
-                    // 6a) to the client
-                    await ctx.Response.Body.WriteAsync(buffer, 0, n);
-                    // 6b) into our tap buffer
-                    await pipeWriter.WriteAsync(buffer, 0, n);
+                    await writer.WriteLineAsync(line);
                 }
+                else if (line.StartsWith("data: "))
+                {
+                    await Console.Error.WriteLineAsync("---- RAW RESPONSE LINE ----\n" + line);
+                    var chunk = ReadJsonDataLine<ChatCompletionChunkDto>(line);
+                    if (chunk is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Could not parse ChatCompletionChunkDto from line '{line}'");
+                    }
 
-                pipeWriter.Flush();
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
+                    await Console.Error.WriteLineAsync("---- Parsed Chunk RESPONSE LINE ----\n" + JsonSerializer.Serialize(chunk));
+                    
+
+                    if (chunk.ServiceTier is null)
+                    {
+                        chunk.ServiceTier = "default";
+                    }
+
+                    if (chunk.SystemFingerprint is null)
+                    {
+                        chunk.SystemFingerprint = "fp_a1102cf978";
+                    }
+                    
+                    if (chunk.Choices?.Count > 0)
+                    {
+                        if (chunk.Choices[0] != null)
+                        {
+                            if (lastWasToolCall && chunk.Choices[0].FinishReason == "stop")
+                            {
+                                chunk.Choices[0].FinishReason = "tool_calls";
+                            }
+                        }
+                        
+                        if (chunk.Choices[0]?.Delta?.ToolCalls?.Count > 0)
+                        {
+                            if (chunk.Choices[0].Delta.Role is null)
+                            {
+                                chunk.Choices[0].Delta.Role = "assistant";
+                            }
+                        
+                            var argument = chunk.Choices[0].Delta.ToolCalls[0].Function?.Arguments;
+                            if (!string.IsNullOrEmpty(argument))
+                            {
+                                // Split up tool call
+                                chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments = "";
+                                
+                                await writer.WriteAsync("data: ");
+                                await Console.Error.WriteLineAsync("---- Modified chunk RESPONSE LINE (split) ----\n" + JsonSerializer.Serialize(chunk));
+                                await JsonSerializer.SerializeAsync(writer.BaseStream, chunk);
+                                await writer.WriteLineAsync();
+                                await writer.FlushAsync();
+                                
+                                await writer.WriteLineAsync();
+                                await writer.FlushAsync();
+                                
+                                // Split 2
+                                chunk.Choices[0].Delta.ToolCalls[0].Function.Name = null;
+                                chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments = argument;
+                                chunk.Choices[0].Delta.ToolCalls[0].Id = null;
+                                chunk.Choices[0].Delta.ToolCalls[0].Type = null;
+                                chunk.Choices[0].Delta.Role = null;
+                            }
+                            
+                            lastWasToolCall = true;
+                        }
+                        else
+                        {
+                            lastWasToolCall = false;
+                        }
+                    }
+                    else
+                    {
+                        lastWasToolCall = false;
+                    }
+
+                    await Console.Error.WriteLineAsync("---- Modified chunk RESPONSE LINE ----\n" + JsonSerializer.Serialize(chunk));
+                    await writer.WriteAsync("data: ");
+                    await JsonSerializer.SerializeAsync(writer.BaseStream, chunk);
+                    await writer.WriteLineAsync();
+                }
+                else
+                {
+                    await Console.Error.WriteLineAsync("---- RAW RESPONSE LINE (decompressed) ----\n" + line);
+                    await writer.WriteLineAsync(line);
+                }
+                
+                await writer.FlushAsync();
             }
         }
+        else
+        {
+            var pipe = new Pipe();
+            Task logTask;
+            {
+                await using var pipeWriter = pipe.Writer.AsStream();
+                logTask = Task.Run(async () =>
+                {
+                    await using var pipeReader = pipe.Reader.AsStream();
+                    var reader = ProxyHelper.ReadDecodedLines(contentEncoding, pipeReader);
+                    while (await reader.ReadLineAsync() is { } line)
+                    {
+                        if (!string.IsNullOrEmpty(line))
+                            Console.Error.WriteLine("---- RAW RESPONSE LINE (decompressed) ----\n" + line);
+                    }
+                });
 
-        await logTask;
+                var buffer = ArrayPool<byte>.Shared.Rent(81920);
+                try
+                {
+                    int n;
+                    var stream = await resp.Content.ReadAsStreamAsync();
+                    while ((n = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                    {
+                        // 6a) to the client
+                        await ctx.Response.Body.WriteAsync(buffer, 0, n);
+                        // 6b) into our tap buffer
+                        await pipeWriter.WriteAsync(buffer, 0, n);
+                    }
+
+                    pipeWriter.Flush();
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+
+            await logTask;
+        }
+        
     }
 }

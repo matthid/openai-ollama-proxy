@@ -142,21 +142,21 @@ public class ProxyHelper
         }
     }
     
-    public static StreamReader ReadDecodedLines(ICollection<string> contentEncoding, Stream memoryStream)
+    public static StreamReader ReadDecodedLines(ICollection<string> contentEncoding, Stream data)
     {
         Stream? decoded;
         if (contentEncoding.Contains("gzip"))
         {
-            decoded = new GZipStream(memoryStream, CompressionMode.Decompress);
+            decoded = new GZipStream(data, CompressionMode.Decompress);
         }
         else if (contentEncoding.Contains("br"))
         {
-            decoded = new BrotliStream(memoryStream, CompressionMode.Decompress);
+            decoded = new BrotliStream(data, CompressionMode.Decompress);
         }
         else
         {
             // no known encoding, assume plain
-            decoded = memoryStream;
+            decoded = data;
         }
 
         return new StreamReader(decoded);

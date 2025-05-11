@@ -40,6 +40,7 @@ builder.Services.AddResponseCompression(options =>
 
 var app     = builder.Build();
 
+app.UseResponseCompression();
 
 // ————— CONFIG —————
 var remoteBase = Environment.GetEnvironmentVariable("OPENWEBUI_ENDPOINT");
