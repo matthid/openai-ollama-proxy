@@ -137,44 +137,41 @@ public class OpenAiChatStream
                         chunk.SystemFingerprint = "fp_a1102cf978";
                     }
                     
-                    if (chunk.Choices?.Count > 0)
+                    if (chunk.Choices?.Count > 0 && chunk.Choices[0] is {} firstChoice)
                     {
-                        if (chunk.Choices[0] != null)
+                        if (lastWasToolCall && firstChoice.FinishReason == "stop")
                         {
-                            if (lastWasToolCall && chunk.Choices[0].FinishReason == "stop")
-                            {
-                                chunk.Choices[0].FinishReason = "tool_calls";
-                            }
+                            firstChoice.FinishReason = "tool_calls";
                         }
                         
-                        if (chunk.Choices[0]?.Delta?.ToolCalls?.Count > 0)
+                        if (firstChoice.Delta?.ToolCalls?.Count > 0)
                         {
-                            if (chunk.Choices[0].Delta.Role is null)
+                            if (firstChoice.Delta.Role is null)
                             {
-                                chunk.Choices[0].Delta.Role = "assistant";
+                                firstChoice.Delta.Role = "assistant";
                             }
                         
-                            var argument = chunk.Choices[0].Delta.ToolCalls[0].Function?.Arguments;
-                            if (!string.IsNullOrEmpty(argument))
+                            var argument = firstChoice.Delta.ToolCalls[0].Function?.Arguments;
+                            if (!string.IsNullOrEmpty(argument) && firstChoice.Delta.ToolCalls[0] is {} firstToolCall && firstToolCall.Function is {})
                             {
                                 // Split up tool call
-                                chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments = "";
+                                firstToolCall.Function.Arguments = "";
                                 
                                 await writer.WriteAsync("data: ");
+                                await writer.FlushAsync();
                                 await Console.Error.WriteLineAsync("---- Modified chunk RESPONSE LINE (split) ----\n" + JsonSerializer.Serialize(chunk));
                                 await JsonSerializer.SerializeAsync(writer.BaseStream, chunk);
-                                await writer.WriteLineAsync();
                                 await writer.FlushAsync();
+                                await writer.WriteLineAsync();
+                                await writer.WriteLineAsync();
                                 
-                                await writer.WriteLineAsync();
-                                await writer.FlushAsync();
                                 
                                 // Split 2
-                                chunk.Choices[0].Delta.ToolCalls[0].Function.Name = null;
-                                chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments = argument;
-                                chunk.Choices[0].Delta.ToolCalls[0].Id = null;
-                                chunk.Choices[0].Delta.ToolCalls[0].Type = null;
-                                chunk.Choices[0].Delta.Role = null;
+                                firstToolCall.Function.Name = null;
+                                firstToolCall.Function.Arguments = argument;
+                                firstToolCall.Id = null;
+                                firstToolCall.Type = null;
+                                firstChoice.Delta.Role = null;
                             }
                             
                             lastWasToolCall = true;
@@ -191,7 +188,9 @@ public class OpenAiChatStream
 
                     await Console.Error.WriteLineAsync("---- Modified chunk RESPONSE LINE ----\n" + JsonSerializer.Serialize(chunk));
                     await writer.WriteAsync("data: ");
+                    await writer.FlushAsync();
                     await JsonSerializer.SerializeAsync(writer.BaseStream, chunk);
+                    await writer.FlushAsync();
                     await writer.WriteLineAsync();
                 }
                 else
