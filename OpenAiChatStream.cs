@@ -104,6 +104,8 @@ public class OpenAiChatStream
             var reader = ProxyHelper.ReadDecodedLines(contentEncoding, await resp.Content.ReadAsStreamAsync());
             var writer = new StreamWriter(ctx.Response.Body);
             bool lastWasToolCall = false;
+            bool finishSent = false;
+            ChatCompletionChunkDto? lastChunk = null;
             while (await reader.ReadLineAsync() is { } line)
             {
                 if (string.IsNullOrEmpty(line))
@@ -112,6 +114,37 @@ public class OpenAiChatStream
                 }
                 else if (line.Contains("[DONE]"))
                 {
+                    if (!finishSent)
+                    {
+                        var stopChunk = new ChatCompletionChunkDto()
+                        {
+                            Choices = new List<ChoiceDto?>()
+                            {
+                                new ChoiceDto()
+                                {
+                                    FinishReason = "stop",
+                                    Delta = new DeltaDto(),
+                                    Index = 0
+                                }
+                            },
+                            SystemFingerprint = "fp_a1102cf978",
+                            Object = "chat.completion.chunk",
+                            Model = lastChunk?.Model ?? "unknown",
+                            Id = lastChunk?.Id ?? "unknown",
+                            Created = lastChunk?.Created ?? 1747166839,
+                            ServiceTier = lastChunk?.ServiceTier ?? "default",
+                        };
+                        await writer.WriteAsync("data: ");
+                        await writer.FlushAsync();
+                        await Console.Error.WriteLineAsync("---- STOP ----\n" + JsonSerializer.Serialize(stopChunk));
+                        await JsonSerializer.SerializeAsync(writer.BaseStream, stopChunk);
+                        await writer.FlushAsync();
+                        await writer.WriteLineAsync();
+                        await writer.WriteLineAsync();
+                        await writer.FlushAsync();
+                    }
+                    
+                    await Console.Error.WriteLineAsync("---- DONE ----\n" + line);
                     await writer.WriteLineAsync(line);
                 }
                 else if (line.StartsWith("data: "))
@@ -123,6 +156,8 @@ public class OpenAiChatStream
                         throw new InvalidOperationException(
                             $"Could not parse ChatCompletionChunkDto from line '{line}'");
                     }
+
+                    lastChunk = chunk;
 
                     await Console.Error.WriteLineAsync("---- Parsed Chunk RESPONSE LINE ----\n" + JsonSerializer.Serialize(chunk));
                     
@@ -139,9 +174,13 @@ public class OpenAiChatStream
                     
                     if (chunk.Choices?.Count > 0 && chunk.Choices[0] is {} firstChoice)
                     {
-                        if (lastWasToolCall && firstChoice.FinishReason == "stop")
+                        if (firstChoice.FinishReason == "stop")
                         {
-                            firstChoice.FinishReason = "tool_calls";
+                            finishSent = true;
+                            if (lastWasToolCall)
+                            {
+                                firstChoice.FinishReason = "tool_calls";
+                            }
                         }
                         
                         if (firstChoice.Delta?.ToolCalls?.Count > 0)
