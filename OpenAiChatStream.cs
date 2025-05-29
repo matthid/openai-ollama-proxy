@@ -27,7 +27,7 @@ public class OpenAiChatStream
     }
     public static async Task HandleApiChat(HttpClient client, HttpContext ctx)
     {
-        var path = "/api/chat/completions";
+        var path = "/chat/completions";
 
         // build the upstream URI
         var upstream = path + ctx.Request.QueryString;

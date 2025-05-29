@@ -16,7 +16,7 @@ public class Models
         }
         
         // 1) fetch remote model list
-        var upstream = await httpClient.GetAsync("/api/models");
+        var upstream = await httpClient.GetAsync("/models");
         ctx.Response.StatusCode = (int)upstream.StatusCode;
 
         if (!upstream.IsSuccessStatusCode)

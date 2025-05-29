@@ -43,8 +43,8 @@ var app     = builder.Build();
 app.UseResponseCompression();
 
 // ————— CONFIG —————
-var remoteBase = Environment.GetEnvironmentVariable("OPENWEBUI_ENDPOINT");
-var apiKey     = Environment.GetEnvironmentVariable("OPENWEBUI_API_KEY");
+var remoteBase = Environment.GetEnvironmentVariable("OPENAI_BASE_URL");
+var apiKey     = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 // ——————————————————
 
 var httpClient = new HttpClient { BaseAddress = new Uri(remoteBase) };
@@ -84,7 +84,7 @@ app.MapGet("/",  async ctx =>
 });
 
 app.MapPost("/openai/api/chat/completions",   ctx => OpenAiChatStream.HandleApiChat(httpClient, ctx));
-app.MapGet("/openai/api/models",   ctx => ProxyHelper.Proxy(ctx, httpClient, "/api/models", logData: true));
+app.MapGet("/openai/api/models",   ctx => ProxyHelper.Proxy(ctx, httpClient, "/models", logData: true));
 
 
 app.Run("http://*:4222");

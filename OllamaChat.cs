@@ -60,7 +60,7 @@ public class OllamaChat
 
         // 3) Send to remote with stream=true
         var req = new HttpRequestMessage(HttpMethod.Post,
-            "/api/chat/completions")
+            "/chat/completions")
         {
             Content = new ByteArrayContent(newBody)
         };
@@ -141,16 +141,17 @@ public class OllamaChat
                 : "";
 
             // finish_reason
-            var finishTok = choice.GetProperty("finish_reason");
-            var isDone = finishTok.ValueKind != JsonValueKind.Null;
+            var isDone = choice.TryGetProperty("finish_reason", out var finishTok) && finishTok.ValueKind != JsonValueKind.Null;
+            var finishReason = isDone ?  finishTok.GetString() : null;
             if (isDone)
             {
                 doneSent = true;
                 sw.Stop();
             }
+            
 
             // Start writing our Ollama object
-            string json = await WriteOllamaObject(model, createdAt, content, isDone, finishTok.GetString(), chunk, sw);
+            string json = await WriteOllamaObject(model, createdAt, content, isDone, finishReason, chunk, sw);
             await ctx.Response.WriteAsync(json + (isDone ? "\n\n" : "\n"));
             await ctx.Response.Body.FlushAsync();
 
