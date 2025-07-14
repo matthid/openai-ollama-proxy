@@ -43,8 +43,20 @@ var app     = builder.Build();
 app.UseResponseCompression();
 
 // ————— CONFIG —————
-var remoteBase = Environment.GetEnvironmentVariable("OPENAI_BASE_URL");
-var apiKey     = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+var remoteBase = 
+    Environment.GetEnvironmentVariable("OPENAI_BASE_URL") ??
+    Environment.GetEnvironmentVariable("LITELLM_PROXY_API_URL")
+    ;
+var apiKey     =
+    Environment.GetEnvironmentVariable("OPENAI_API_KEY") ??
+    Environment.GetEnvironmentVariable("LITELLM_PROXY_API_KEY")
+    ;
+
+if (remoteBase is null || apiKey is null)
+{
+    Console.Error.WriteLine("Please set OPENAI_BASE_URL and OPENAI_API_KEY");
+    return 1;
+}
 // ——————————————————
 
 var httpClient = new HttpClient { BaseAddress = new Uri(remoteBase) };
@@ -88,3 +100,4 @@ app.MapGet("/openai/api/models",   ctx => ProxyHelper.Proxy(ctx, httpClient, "/m
 
 
 app.Run("http://*:4222");
+return 0;

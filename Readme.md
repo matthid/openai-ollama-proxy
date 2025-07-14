@@ -2,8 +2,8 @@
 
 Set Environment variables 
 
-- `OPENAI_BASE_URL`
-- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` or `LITELLM_PROXY_API_BASE`
+- `OPENAI_API_KEY` or `LITELLM_PROXY_API_KEY`
 
 Then run the proxy with
 
