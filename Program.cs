@@ -45,6 +45,7 @@ app.UseResponseCompression();
 // ————— CONFIG —————
 var remoteBase = 
     Environment.GetEnvironmentVariable("OPENAI_BASE_URL") ??
+    Environment.GetEnvironmentVariable("LITELLM_PROXY_API_BASE") ?? // correct one
     Environment.GetEnvironmentVariable("LITELLM_PROXY_API_URL")
     ;
 var apiKey     =
